@@ -1,0 +1,459 @@
+[01/04/26, 8:27:02 PM] sathya: Cheek
+[02/04/26, 12:59:54 AM] Sri: # cspell:ignore preds confs pagesizes pdfgen Retinopathy
+import os
+import io
+import json
+import sqlite3
+import hashlib
+from datetime import datetime
+from datetime import timedelta
+import secrets
+
+import torch
+import torch.nn as nn
+import gradio as gr
+from torchvision import transforms as T
+
+# Dummy model to simulate predictions (updated for RGB input)
+class DummyModel(nn.Module):
+    def _init_(self):
+        super()._init_()
+        self.fc = nn.Linear(3 * 224 * 224, 5)  # 3 channels × 224 × 224 = 150528
+
+    def forward(self, x):
+        x = x.view(x.size(0), -1)  # Flatten the input
+        return self.fc(x)
+
+# Instantiate and set model to evaluation mode
+model = DummyModel()
+model.eval()
+
+# Label mapping
+labels = {
+    0: "No DR",
+    1: "Mild",
+    2: "Moderate",
+    3: "Severe",
+    4: "Proliferative DR",
+}
+
+# Image preprocessing pipeline
+transform = T.Compose([
+    T.Resize((224, 224)),
+    T.ToTensor(),  # Converts to [3, 224, 224]
+    T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225]),
+])
+
+# Prediction function with error handling
+def predict(input_img):
+    try:
+        input_tensor = transform(input_img).unsqueeze(0)  # Add batch dimension
+        with torch.no_grad():
+            output = model(input_tensor)
+            prediction = torch.nn.functional.softmax(output.squeeze(), dim=0)
+            confidences = {labels[i]: float(prediction[i]) for i in labels}
+        return confidences
+    except Exception as e:
+        return {"Error": str(e)}
+
+
+# --- Database utilities (SQLite) ---
+DB_PATH = os.path.join(os.path.dirname(_file_), "db.sqlite3")
+
+def get_db_connection():
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+def init_db():
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY,
+            username TEXT UNIQUE NOT NULL,
+            password_hash TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS predictions (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            image_path TEXT,
+            predicted_label TEXT,
+            confidences TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    # tokens for password reset (demo: token shown in-app; in production send via email)
+    cur.execute(
+        """
+        CREATE TABLE IF NOT EXISTS reset_tokens (
+            id INTEGER PRIMARY KEY,
+            user_id INTEGER NOT NULL,
+            token TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY(user_id) REFERENCES users(id)
+        )
+        """
+    )
+    conn.commit()
+    conn.close()
+
+
+def hash_password(password: str) -> str:
+    return hashlib.sha256(password.encode("utf-8")).hexdigest()
+
+
+def create_user(username: str, password: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    try:
+        cur.execute(
+            "INSERT INTO users (username, password_hash, created_at) VALUES (?, ?, ?)",
+            (username, hash_password(password), datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+        return True
+    except sqlite3.IntegrityError:
+        return False
+    finally:
+        conn.close()
+
+
+def get_user(username: str):
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM users WHERE username = ?", (username,))
+    row = cur.fetchone()
+    conn.close()
+    return row
+
+
+def save_prediction(username: str, image_pil, predicted_label: str, confidences: dict):
+    user = get_user(username)
+    if user is None:
+        return False
+
+    # Ensure directories
+    preds_dir = os.path.join(os.path.dirname(_file_), "artifacts", "predictions")
+    os.makedirs(preds_dir, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    img_name = f"{username}_{ts}.png"
+    img_path = os.path.join(preds_dir, img_name)
+    try:
+        image_pil.save(img_path)
+    except Exception:
+        img_path = None
+
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO predictions (user_id, image_path, predicted_label, confidences, created_at) VALUES (?, ?, ?, ?, ?)",
+        (user["id"], img_path, predicted_label, json.dumps(confidences), datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    return True
+
+
+def create_reset_token(username: str, minutes_valid: int = 15):
+    user = get_user(username)
+    if user is None:
+        return None, "User not found"
+    token = secrets.token_urlsafe(16)
+    expires = (datetime.utcnow() + timedelta(minutes=minutes_valid)).isoformat()
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "INSERT INTO reset_tokens (user_id, token, expires_at, created_at) VALUES (?, ?, ?, ?)",
+        (user["id"], token, expires, datetime.utcnow().isoformat()),
+    )
+    conn.commit()
+    conn.close()
+    # For demo we return the token so the user can paste it into reset form
+    return token, None
+
+
+def verify_reset_token(username: str, token: str):
+    user = get_user(username)
+    if user is None:
+        return False
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "SELECT * FROM reset_tokens WHERE user_id = ? AND token = ? ORDER BY created_at DESC LIMIT 1",
+        (user["id"], token),
+    )
+    row = cur.fetchone()
+    if not row:
+        conn.close()
+        return False
+    expires_at = datetime.fromisoformat(row["expires_at"])
+    if datetime.utcnow() > expires_at:
+        # expired; delete
+        cur.execute("DELETE FROM reset_tokens WHERE id = ?", (row["id"],))
+        conn.commit()
+        conn.close()
+        return False
+    # valid
+    conn.close()
+    return True
+
+
+def reset_password(username: str, token: str, new_password: str):
+    if not verify_reset_token(username, token):
+        return False, "Invalid or expired token"
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute(
+        "UPDATE users SET password_hash = ? WHERE username = ?",
+        (hash_password(new_password), username),
+    )
+    # delete used tokens
+    cur.execute(
+        "DELETE FROM reset_tokens WHERE user_id = (SELECT id FROM users WHERE username = ?)",
+        (username,)
+    )
+    conn.commit()
+    conn.close()
+    return True, None
+
+
+def change_password(username: str, current_password: str, new_password: str):
+    user = get_user(username)
+    if not user:
+        return False, "User not found"
+    if user["password_hash"] != hash_password(current_password):
+        return False, "Current password incorrect"
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("UPDATE users SET password_hash = ? WHERE username = ?", (hash_password(new_password), username))
+    conn.commit()
+    conn.close()
+    return True, None
+
+
+def fetch_predictions_for_user(username: str):
+    user = get_user(username)
+    if user is None:
+        return []
+    conn = get_db_connection()
+    cur = conn.cursor()
+    cur.execute("SELECT * FROM predictions WHERE user_id = ? ORDER BY created_at DESC", (user["id"],))
+    rows = cur.fetchall()
+    conn.close()
+    return rows
+
+
+def generate_pdf_report(username: str):
+    rows = fetch_predictions_for_user(username)
+    reports_dir = os.path.join(os.path.dirname(_file_), "artifacts", "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+    ts = datetime.utcnow().strftime("%Y%m%dT%H%M%S")
+    pdf_path = os.path.join(reports_dir, f"{username}report{ts}.pdf")
+
+    try:
+        # Try to import reportlab; if not available, fall back to a simple text-based PDF
+        from reportlab.lib.pagesizes import letter  # type: ignore[import]
+        from reportlab.pdfgen import canvas  # type: ignore[import]
+
+        c = canvas.Canvas(pdf_path, pagesize=letter)
+        width, height = letter
+        y = height - 40
+        c.setFont("Helvetica-Bold", 14)
+        c.drawString(40, y, f"Prediction report for {username}")
+        y -= 30
+        c.setFont("Helvetica", 10)
+        if not rows:
+            c.drawString(40, y, "No predictions found.")
+        else:
+            for r in rows:
+                created = r["created_at"]
+                label = r["predicted_label"]
+                confs = json.loads(r["confidences"]) if r["confidences"] else {}
+                c.drawString(40, y, f"{created} — {label}")
+                y -= 14
+                for k, v in confs.items():
+                    c.drawString(60, y, f"{k}: {v:.4f}")
+                    y -= 12
+                y -= 8
+                if y < 80:
+                    c.showPage()
+                    y = height - 40
+        c.save()
+        return pdf_path
+    except Exception:
+        # Fallback: write a plain text file with .pdf extension
+        with open(pdf_path, "w", encoding="utf-8") as f:
+            f.write(f"Prediction report for {username}\n\n")
+            if not rows:
+                f.write("No predictions found.\n")
+            else:
+                for r in rows:
+                    created = r["created_at"]
+                    label = r["predicted_label"]
+                    confs = json.loads(r["confidences"]) if r["confidences"] else {}
+                    f.write(f"{created} — {label}\n")
+                    for k, v in confs.items():
+                        f.write(f"  {k}: {v:.6f}\n")
+                    f.write("\n")
+        return pdf_path
+
+
+# --- Gradio Blocks UI with auth and prediction screens ---
+init_db()
+
+
+with gr.Blocks(title="Diabetic Retinopathy Detection App") as dr_app:
+    gr.Markdown("# Diabetic Retinopathy Detection App")
+    gr.Markdown("Please register or log in to use the prediction tool.")
+
+    # Authentication row (tabs for login/register)
+    with gr.Row() as auth_row:
+        with gr.Tabs():
+            with gr.TabItem("Login"):
+                login_username = gr.Textbox(label="Username")
+                login_password = gr.Textbox(label="Password", type="password")
+                login_btn = gr.Button("Login")
+                login_msg = gr.Markdown()
+                with gr.Row():
+                    forgot_username = gr.Textbox(label="Username for password reset")
+                    forgot_btn = gr.Button("Request reset token")
+                    forgot_msg = gr.Markdown()
+            with gr.TabItem("Register"):
+                reg_username = gr.Textbox(label="Username")
+                reg_password = gr.Textbox(label="Password", type="password")
+                reg_btn = gr.Button("Register")
+                reg_msg = gr.Markdown()
+            with gr.TabItem("Reset Password"):
+                reset_username = gr.Textbox(label="Username")
+                reset_token = gr.Textbox(label="Reset token")
+                reset_new_password = gr.Textbox(label="New password", type="password")
+                reset_btn = gr.Button("Reset password")
+                reset_msg = gr.Markdown()
+
+    # Hidden container for prediction interface; becomes visible after login
+    with gr.Row(visible=False) as pred_row:
+        with gr.Column():
+            gr.Markdown("## Upload a retinal image for prediction")
+            image_input = gr.Image(type="pil", label="Retinal Image")
+            predict_btn = gr.Button("Predict")
+        with gr.Column():
+            label_output = gr.Label(num_top_classes=5, label="Prediction")
+            logout_btn = gr.Button("Logout")
+            download_btn = gr.Button("Download PDF report")
+            report_file = gr.File(label="Your report")
+            with gr.Row(visible=False) as change_pw_row:
+                change_current = gr.Textbox(label="Current password", type="password")
+                change_new = gr.Textbox(label="New password", type="password")
+                change_btn = gr.Button("Change password")
+                change_msg = gr.Markdown()
+
+    # --- Handlers ---
+    # We'll use a Gradio state to remember the logged in user for the session
+    logged_in = gr.State("")
+
+    def handle_register(username, password, state):
+        if not username or not password:
+            return "Username and password required.", gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), ""
+        ok = create_user(username, password)
+        if not ok:
+            return "Username already exists.", gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), ""
+        # Auto-login after successful registration
+        state = username
+        return "Registration successful. Logged in.", gr.update(visible=True), gr.update(visible=False), gr.update(visible=True), state
+
+    def handle_login(username, password, state):
+        if not username or not password:
+            return "Username and password required.", gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), state
+        user = get_user(username)
+        if user and user["password_hash"] == hash_password(password):
+            # successful
+            state = username
+            return "Login successful.", gr.update(visible=True), gr.update(visible=False), gr.update(visible=True), state
+        return "Invalid username or password.", gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), ""
+
+    def handle_logout(state):
+        # Hide prediction UI and show auth UI again; clear state
+        return gr.update(visible=False), gr.update(visible=True), gr.update(visible=False), ""
+
+
+    def handle_predict(image, state):
+        # Perform prediction and, if logged in, save to DB
+        res = predict(image)
+        # Determine top label
+        if isinstance(res, dict) and all(k in ("Error",) for k in res):
+            return res
+        # choose top key
+        top_label = max(res.items(), key=lambda x: x[1])[0]
+        if state:
+            try:
+                save_prediction(state, image, top_label, res)
+            except Exception:
+                pass
+        return res
+
+
+    def handle_download_report(state):
+        if not state:
+            return None
+        pdf_path = generate_pdf_report(state)
+        return pdf_path
+
+
+    def handle_request_reset(username):
+        if not username:
+            return "Username required"
+        token, err = create_reset_token(username)
+        if err:
+            return err
+        # show token in-app (demo); in production email this
+        return f"Reset token (demo): {token}"
+
+
+    def handle_reset_password(username, token, new_password):
+        ok, err = reset_password(username, token, new_password)
+        if not ok:
+            return err
+        return "Password reset successful. Please log in."
+
+
+    def handle_change_password(state, current_password, new_password):
+        if not state:
+            return "Not logged in"
+        ok, err = change_password(state, current_password, new_password)
+        if not ok:
+            return err
+        return "Password changed successfully"
+
+    # Hook up interactions
+    # register returns message, show pred_row, hide auth_row, and updates state
+    reg_btn.click(handle_register, [reg_username, reg_password, logged_in], [reg_msg, pred_row, auth_row, change_pw_row, logged_in])
+    # login returns message, show pred_row, hide auth_row, and updates state
+    login_btn.click(handle_login, [login_username, login_password, logged_in], [login_msg, pred_row, auth_row, change_pw_row, logged_in])
+    forgot_btn.click(handle_request_reset, forgot_username, forgot_msg)
+    reset_btn.click(handle_reset_password, [reset_username, reset_token, reset_new_password], reset_msg)
+    predict_btn.click(handle_predict, [image_input, logged_in], label_output)
+    logout_btn.click(handle_logout, logged_in, [pred_row, auth_row, change_pw_row, logged_in])
+    download_btn.click(handle_download_report, logged_in, report_file)
+    change_btn.click(handle_change_password, [logged_in, change_current, change_new], change_msg)
+
+    # Example images available in the repo
+    dr_app.examples = [
+        "data/sample/10_left.jpeg",
+        "data/sample/10_right.jpeg",
+        "data/sample/15_left.jpeg",
+        "data/sample/16_right.jpeg",
+    ]
+
+
+if _name_ == "_main_":
+    dr_app.launch()
